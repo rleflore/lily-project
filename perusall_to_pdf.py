@@ -84,7 +84,7 @@ def fetch_pdf(article_url, debug=False):
         def log(msg):
             debug_log.append(msg)
             if debug:
-                print(f"[DEBUG] {msg}")
+                print(f"[DEBUG] {msg}", flush=True)
 
         try:
             # Navigate and collect ALL network responses
