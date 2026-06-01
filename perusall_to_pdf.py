@@ -87,21 +87,21 @@ def fetch_pdf(article_url, debug=False):
                 print(f"[DEBUG] {msg}", flush=True)
 
         try:
-            # Collect all network responses
+            # Collect network responses
             all_responses = []
-            cloudfront_pages = []
+            text_content_jsons = []
 
             def capture_response(response):
                 content_type = response.headers.get("content-type", "")
                 url = response.url
                 all_responses.append((url, content_type, response))
 
-                # Track CloudFront page images specifically
-                if "cloudfront.net/pages/" in url:
-                    cloudfront_pages.append((url, response))
-                    log(f"  📄 Page image: {url[:120]}")
+                # Track text-content JSON files (our primary target)
+                if "text-content" in url and ".json" in url:
+                    text_content_jsons.append((url, response))
+                    log(f"  📝 Text content: {url[:100]}")
 
-                # Log other interesting responses
+                # Log PDF responses
                 elif any(kw in url.lower() for kw in ["pdf", "document-file", "original-file"]):
                     log(f"  → {response.status} | {content_type[:40]} | {url[:120]}")
 
@@ -136,25 +136,34 @@ def fetch_pdf(article_url, debug=False):
                     "Run 'python app.py --login' again."
                 )
 
-            # Step 3: Wait for the document viewer to fully load
+            # Step 3: Wait for document viewer to load
             log("Waiting for document viewer to load...")
-            time.sleep(15)
+            time.sleep(10)
 
-            log(f"CloudFront page images captured so far: {len(cloudfront_pages)}")
-            log(f"Total network responses: {len(all_responses)}")
+            # Step 4: Scroll through all pages to trigger text-content loading
+            log("Scrolling through pages to load all text content...")
+            page_elements = page.query_selector_all('[class*="page"]')
+            log(f"Found {len(page_elements)} page elements")
+
+            for i, elem in enumerate(page_elements):
+                try:
+                    elem.scroll_into_view_if_needed(timeout=5000)
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+
+            # Wait for remaining network requests
+            time.sleep(5)
+            log(f"Text content JSONs captured: {len(text_content_jsons)}")
 
             # Strategy 1: Check for direct PDF in responses
             pdf_data = _check_responses_for_pdf(all_responses, log)
 
-            # Strategy 2: Use CloudFront page images to build PDF
+            # Strategy 2: Build text PDF from text-content JSONs (primary strategy)
             if not pdf_data:
-                pdf_data = _build_pdf_from_cloudfront(page, cloudfront_pages, log)
+                pdf_data = _build_text_pdf(text_content_jsons, log)
 
-            # Strategy 3: Try fetching full-size pages from CloudFront
-            if not pdf_data:
-                pdf_data = _fetch_fullsize_pages(page, cloudfront_pages, log)
-
-            # Strategy 4: Screenshot the rendered document
+            # Strategy 3: Screenshot fallback
             if not pdf_data:
                 pdf_data = _screenshot_to_pdf(page, log)
 
@@ -191,110 +200,118 @@ def _check_responses_for_pdf(all_responses, log):
     return None
 
 
-def _build_pdf_from_cloudfront(page, cloudfront_pages, log):
+def _build_text_pdf(text_content_jsons, log):
     """
-    Build a PDF from CloudFront page images that were already loaded.
-    Perusall loads thumbnails first; we'll use those if full-size aren't available.
+    Build a text-based PDF from Perusall's text-content JSON files.
+    Each JSON contains positioned text items for one page.
+    
+    Transform format: [fontSize, 0, 0, fontSize, x, y]
+    - Index 0: font size
+    - Index 4: x position (from left)
+    - Index 5: y position (from bottom, PDF coordinate system)
     """
-    from PIL import Image
+    import json
     from fpdf import FPDF
 
-    if not cloudfront_pages:
-        log("No CloudFront page images captured.")
+    if not text_content_jsons:
+        log("No text-content JSONs available.")
         return None
 
-    log(f"Building PDF from {len(cloudfront_pages)} CloudFront page images...")
+    log(f"Building text PDF from {len(text_content_jsons)} pages...")
 
-    images = []
-    for url, resp in cloudfront_pages:
+    # Parse all page JSONs
+    pages_data = []
+    for url, resp in text_content_jsons:
         try:
             body = resp.body()
-            if len(body) > 1000:
-                img = Image.open(BytesIO(body))
-                images.append((url, img))
+            data = json.loads(body)
+            if "items" in data and data["items"]:
+                pages_data.append(data["items"])
         except Exception as e:
-            log(f"  Failed to read image: {e}")
+            log(f"  Failed to parse JSON: {e}")
             continue
 
-    if not images:
-        log("Could not read any page images.")
+    if not pages_data:
+        log("No valid text data found in JSONs.")
         return None
 
-    # Sort by URL to maintain page order (they often have sequential IDs)
-    log(f"Got {len(images)} readable page images")
+    log(f"Parsed {len(pages_data)} pages of text content")
 
-    pdf = FPDF()
-    for url, img in images:
-        tmp_path = Path(__file__).parent / ".tmp_page_img.png"
-        img.save(str(tmp_path))
+    # Determine page dimensions from the text positions
+    # Standard PDF page is 612x792 points (US Letter)
+    PAGE_WIDTH_PT = 612
+    PAGE_HEIGHT_PT = 792
 
-        width_mm = img.width * 0.264583
-        height_mm = img.height * 0.264583
-        if width_mm > 200:
-            scale = 200 / width_mm
-            width_mm *= scale
-            height_mm *= scale
+    # Create PDF with fpdf2
+    pdf = FPDF(unit="pt", format="letter")
+    pdf.set_auto_page_break(auto=False)
 
-        pdf.add_page(orientation="P" if height_mm > width_mm else "L")
-        pdf.image(str(tmp_path), x=5, y=5, w=width_mm)
-        os.remove(tmp_path)
+    for page_idx, items in enumerate(pages_data):
+        pdf.add_page()
 
-    return bytes(pdf.output())
+        # Find the bounding box of text on this page to determine scale
+        max_y = 0
+        min_y = float('inf')
+        max_x = 0
+        for item in items:
+            if not item.get("str") or not item.get("transform"):
+                continue
+            t = item["transform"]
+            if len(t) >= 6:
+                y = t[5]
+                x = t[4]
+                if y > max_y:
+                    max_y = y
+                if y < min_y:
+                    min_y = y
+                if x + item.get("width", 0) > max_x:
+                    max_x = x + item.get("width", 0)
 
+        # Scale factor to fit content to page
+        content_height = max_y - min_y if max_y > min_y else PAGE_HEIGHT_PT
+        scale_x = PAGE_WIDTH_PT / max(max_x, PAGE_WIDTH_PT) if max_x > 0 else 1.0
+        scale_y = (PAGE_HEIGHT_PT - 40) / content_height if content_height > 0 else 1.0
+        scale = min(scale_x, scale_y, 1.3)  # Don't scale up too much
 
-def _fetch_fullsize_pages(page, cloudfront_pages, log):
-    """
-    Perusall loads thumbnail versions of pages. Try to fetch full-size versions
-    by removing '-thumbnail' from the URL.
-    """
-    from PIL import Image
-    from fpdf import FPDF
+        for item in items:
+            text = item.get("str", "")
+            if not text:
+                continue
 
-    if not cloudfront_pages:
-        return None
+            transform = item.get("transform", [10, 0, 0, 10, 0, 0])
+            if len(transform) < 6:
+                continue
 
-    log("Attempting to fetch full-size page images...")
+            font_size = transform[0]
+            x = transform[4]
+            # Flip y-coordinate (PDF origin is bottom-left, fpdf is top-left)
+            y = max_y - transform[5]
 
-    # Extract page IDs from thumbnail URLs and try full-size
-    fullsize_images = []
-    for url, _ in cloudfront_pages:
-        # URL pattern: .../pages/{id}-thumbnail.png?Expires=...
-        fullsize_url = url.replace("-thumbnail", "")
-        log(f"  Trying full-size: {fullsize_url[:100]}")
-        try:
-            resp = page.request.get(fullsize_url)
-            if resp.ok:
-                body = resp.body()
-                if len(body) > 5000:
-                    img = Image.open(BytesIO(body))
-                    fullsize_images.append((fullsize_url, img))
-                    log(f"  ✓ Got full-size page: {img.width}x{img.height}")
-        except Exception as e:
-            log(f"  ✗ Failed: {e}")
-            continue
+            # Apply scaling
+            x_scaled = x * scale + 20  # 20pt left margin
+            y_scaled = y * scale + 30  # 30pt top margin
+            font_size_scaled = font_size * scale
 
-    if not fullsize_images:
-        log("Could not fetch any full-size pages.")
-        return None
+            # Clamp to page bounds
+            if y_scaled > PAGE_HEIGHT_PT - 20 or x_scaled > PAGE_WIDTH_PT - 20:
+                continue
 
-    log(f"Building PDF from {len(fullsize_images)} full-size pages...")
-    pdf = FPDF()
-    for url, img in fullsize_images:
-        tmp_path = Path(__file__).parent / ".tmp_page_img.png"
-        img.save(str(tmp_path))
+            # Determine if bold based on font name
+            font_name = item.get("fontName", "")
+            style = ""
+            if "bold" in font_name.lower() or "f1" in font_name:
+                style = "B"
 
-        width_mm = img.width * 0.264583
-        height_mm = img.height * 0.264583
-        if width_mm > 200:
-            scale = 200 / width_mm
-            width_mm *= scale
-            height_mm *= scale
+            try:
+                pdf.set_font("Helvetica", style=style, size=max(6, min(font_size_scaled, 24)))
+                pdf.set_xy(x_scaled, y_scaled)
+                pdf.cell(text=text)
+            except Exception:
+                pass
 
-        pdf.add_page(orientation="P" if height_mm > width_mm else "L")
-        pdf.image(str(tmp_path), x=5, y=5, w=width_mm)
-        os.remove(tmp_path)
-
-    return bytes(pdf.output())
+    pdf_bytes = pdf.output()
+    log(f"Text PDF built: {len(pdf_bytes)} bytes, {len(pages_data)} pages")
+    return bytes(pdf_bytes)
 
 
 def _screenshot_to_pdf(page, log):
