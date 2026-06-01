@@ -72,7 +72,7 @@ def fetch_pdf(article_url, debug=False):
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
             user_data_dir=str(SESSION_DIR),
-            headless=False,  # Use visible browser to avoid session issues
+            headless=False,
             viewport={"width": 1400, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],
         )
@@ -87,55 +87,74 @@ def fetch_pdf(article_url, debug=False):
                 print(f"[DEBUG] {msg}", flush=True)
 
         try:
-            # Navigate and collect ALL network responses
+            # Collect all network responses
             all_responses = []
+            cloudfront_pages = []
 
             def capture_response(response):
                 content_type = response.headers.get("content-type", "")
                 url = response.url
                 all_responses.append((url, content_type, response))
-                # Log interesting responses
-                if any(kw in url.lower() for kw in ["pdf", "document", "file", "asset", "page", "image", "render"]):
+
+                # Track CloudFront page images specifically
+                if "cloudfront.net/pages/" in url:
+                    cloudfront_pages.append((url, response))
+                    log(f"  📄 Page image: {url[:120]}")
+
+                # Log other interesting responses
+                elif any(kw in url.lower() for kw in ["pdf", "document-file", "original-file"]):
                     log(f"  → {response.status} | {content_type[:40]} | {url[:120]}")
 
             page.on("response", capture_response)
 
+            # Step 1: Navigate to the article
             log(f"Navigating to: {article_url}")
             page.goto(article_url, wait_until="domcontentloaded", timeout=45000)
-            time.sleep(3)
 
-            # Check if we're actually logged in
+            # Step 2: Wait for potential OAuth redirect to complete
+            log("Waiting for auth redirect to settle...")
+            time.sleep(5)
+
             current_url = page.url
-            log(f"Current URL after nav: {current_url}")
+            log(f"Current URL: {current_url}")
 
-            if "login" in current_url or "accounts.google" in current_url or "signin" in current_url:
+            # If we got redirected away from the article (OAuth flow), go back
+            article_path = article_url.split("perusall.com")[-1].split("?")[0]
+            if article_path not in current_url:
+                if "perusall.com" in current_url:
+                    log("Redirected after auth — navigating back to article...")
+                    page.goto(article_url, wait_until="domcontentloaded", timeout=45000)
+                    time.sleep(5)
+                    current_url = page.url
+                    log(f"URL after re-navigation: {current_url}")
+
+            # Check if login failed entirely
+            if "login" in current_url and "perusall" not in current_url:
                 browser.close()
                 raise RuntimeError(
-                    "Session expired — the browser was redirected to login. "
+                    "Session expired — redirected to login. "
                     "Run 'python app.py --login' again."
                 )
 
-            # Wait for the document viewer to load
-            log("Waiting for document to render...")
-            time.sleep(10)
+            # Step 3: Wait for the document viewer to fully load
+            log("Waiting for document viewer to load...")
+            time.sleep(15)
 
-            # Log page title and some DOM info
-            title = page.title()
-            log(f"Page title: {title}")
+            log(f"CloudFront page images captured so far: {len(cloudfront_pages)}")
+            log(f"Total network responses: {len(all_responses)}")
 
-            # Strategy 1: Look for PDF in network responses
-            log(f"Total network responses captured: {len(all_responses)}")
+            # Strategy 1: Check for direct PDF in responses
             pdf_data = _check_responses_for_pdf(all_responses, log)
 
-            # Strategy 2: Look for document images/pages from Perusall's API
+            # Strategy 2: Use CloudFront page images to build PDF
             if not pdf_data:
-                pdf_data = _extract_perusall_pages(page, all_responses, log)
+                pdf_data = _build_pdf_from_cloudfront(page, cloudfront_pages, log)
 
-            # Strategy 3: Extract PDF URL from page JavaScript
+            # Strategy 3: Try fetching full-size pages from CloudFront
             if not pdf_data:
-                pdf_data = _extract_pdf_url(page, log)
+                pdf_data = _fetch_fullsize_pages(page, cloudfront_pages, log)
 
-            # Strategy 4: Screenshot the rendered pages
+            # Strategy 4: Screenshot the rendered document
             if not pdf_data:
                 pdf_data = _screenshot_to_pdf(page, log)
 
@@ -159,7 +178,6 @@ def _check_responses_for_pdf(all_responses, log):
     for url, content_type, resp in all_responses:
         if ("application/pdf" in content_type or
                 url.endswith(".pdf") or
-                "/pdf/" in url or
                 "document-file" in url or
                 "original-file" in url):
             try:
@@ -169,65 +187,46 @@ def _check_responses_for_pdf(all_responses, log):
                     return body
             except Exception:
                 continue
-    log("No PDF found in network responses.")
+    log("No direct PDF found in network responses.")
     return None
 
 
-def _extract_perusall_pages(page, all_responses, log):
+def _build_pdf_from_cloudfront(page, cloudfront_pages, log):
     """
-    Perusall often loads documents as individual page images from S3/CloudFront.
-    Collect those images and combine into a PDF.
+    Build a PDF from CloudFront page images that were already loaded.
+    Perusall loads thumbnails first; we'll use those if full-size aren't available.
     """
     from PIL import Image
     from fpdf import FPDF
 
-    log("Looking for page images in network responses...")
-
-    # Look for image responses that could be document pages
-    image_urls = []
-    for url, content_type, resp in all_responses:
-        if ("image/" in content_type and
-                resp.status == 200 and
-                any(kw in url for kw in ["page", "document", "asset", "cloudfront", "s3.amazonaws"])):
-            image_urls.append((url, resp))
-
-    # Also look for Perusall's specific API patterns
-    for url, content_type, resp in all_responses:
-        if (resp.status == 200 and
-                ("image/png" in content_type or "image/jpeg" in content_type) and
-                len(url) > 50):  # Long URLs are typically CDN/asset URLs
-            if (url, resp) not in image_urls:
-                image_urls.append((url, resp))
-
-    log(f"Found {len(image_urls)} potential page images")
-
-    if not image_urls:
+    if not cloudfront_pages:
+        log("No CloudFront page images captured.")
         return None
 
-    # Download and sort images by URL (often numbered)
+    log(f"Building PDF from {len(cloudfront_pages)} CloudFront page images...")
+
     images = []
-    for url, resp in image_urls:
+    for url, resp in cloudfront_pages:
         try:
             body = resp.body()
-            if len(body) > 5000:  # Skip tiny images (icons, etc.)
+            if len(body) > 1000:
                 img = Image.open(BytesIO(body))
-                if img.width > 200 and img.height > 200:  # Skip small images
-                    images.append((url, img))
-                    log(f"  Page image: {img.width}x{img.height} from {url[:80]}")
-        except Exception:
+                images.append((url, img))
+        except Exception as e:
+            log(f"  Failed to read image: {e}")
             continue
 
-    if len(images) < 1:
-        log("No usable page images found.")
+    if not images:
+        log("Could not read any page images.")
         return None
 
-    log(f"Building PDF from {len(images)} page images...")
+    # Sort by URL to maintain page order (they often have sequential IDs)
+    log(f"Got {len(images)} readable page images")
+
     pdf = FPDF()
-    for _, img in images:
-        # Save to temp buffer
-        img_buffer = BytesIO()
-        img.save(img_buffer, format="PNG")
-        img_buffer.seek(0)
+    for url, img in images:
+        tmp_path = Path(__file__).parent / ".tmp_page_img.png"
+        img.save(str(tmp_path))
 
         width_mm = img.width * 0.264583
         height_mm = img.height * 0.264583
@@ -237,77 +236,65 @@ def _extract_perusall_pages(page, all_responses, log):
             height_mm *= scale
 
         pdf.add_page(orientation="P" if height_mm > width_mm else "L")
-        # fpdf2 supports reading from BytesIO
-        tmp_path = Path(__file__).parent / ".tmp_page_img.png"
-        img.save(str(tmp_path))
         pdf.image(str(tmp_path), x=5, y=5, w=width_mm)
         os.remove(tmp_path)
 
     return bytes(pdf.output())
 
 
-def _extract_pdf_url(page, log):
-    """Try to find a PDF URL in Perusall's JavaScript state."""
-    log("Searching page JavaScript for PDF URLs...")
-    try:
-        doc_info = page.evaluate("""
-            () => {
-                const results = [];
+def _fetch_fullsize_pages(page, cloudfront_pages, log):
+    """
+    Perusall loads thumbnail versions of pages. Try to fetch full-size versions
+    by removing '-thumbnail' from the URL.
+    """
+    from PIL import Image
+    from fpdf import FPDF
 
-                // Check __NEXT_DATA__
-                if (window.__NEXT_DATA__) {
-                    results.push(JSON.stringify(window.__NEXT_DATA__).substring(0, 10000));
-                }
+    if not cloudfront_pages:
+        return None
 
-                // Check all script tags
-                const scripts = document.querySelectorAll('script');
-                for (const s of scripts) {
-                    const text = s.textContent;
-                    if (text.includes('pdf') || text.includes('document') || text.includes('fileUrl')) {
-                        results.push(text.substring(0, 5000));
-                    }
-                }
+    log("Attempting to fetch full-size page images...")
 
-                // Check for React fiber / state with document data
-                const root = document.getElementById('__next') || document.getElementById('root');
-                if (root && root._reactRootContainer) {
-                    try {
-                        const state = root._reactRootContainer._internalRoot.current.memoizedState;
-                        results.push(JSON.stringify(state).substring(0, 5000));
-                    } catch(e) {}
-                }
+    # Extract page IDs from thumbnail URLs and try full-size
+    fullsize_images = []
+    for url, _ in cloudfront_pages:
+        # URL pattern: .../pages/{id}-thumbnail.png?Expires=...
+        fullsize_url = url.replace("-thumbnail", "")
+        log(f"  Trying full-size: {fullsize_url[:100]}")
+        try:
+            resp = page.request.get(fullsize_url)
+            if resp.ok:
+                body = resp.body()
+                if len(body) > 5000:
+                    img = Image.open(BytesIO(body))
+                    fullsize_images.append((fullsize_url, img))
+                    log(f"  ✓ Got full-size page: {img.width}x{img.height}")
+        except Exception as e:
+            log(f"  ✗ Failed: {e}")
+            continue
 
-                return results.join('\\n---\\n');
-            }
-        """)
+    if not fullsize_images:
+        log("Could not fetch any full-size pages.")
+        return None
 
-        if doc_info:
-            log(f"Found {len(doc_info)} chars of JS state")
-            # Look for various URL patterns
-            patterns = [
-                r'(https?://[^"\'\s\\]+\.pdf[^"\'\s\\]*)',
-                r'"(https?://[^"\\]+cloudfront[^"\\]+)"',
-                r'"(https?://[^"\\]+s3[^"\\]+)"',
-                r'"fileUrl"\s*:\s*"(https?://[^"\\]+)"',
-                r'"url"\s*:\s*"(https?://[^"\\]+(?:pdf|document|file)[^"\\]*)"',
-            ]
-            for pattern in patterns:
-                matches = re.findall(pattern, doc_info)
-                for match in matches:
-                    log(f"  Trying URL: {match[:100]}")
-                    try:
-                        resp = page.request.get(match)
-                        if resp.ok:
-                            body = resp.body()
-                            if body[:4] == b"%PDF":
-                                log("Found working PDF URL!")
-                                return body
-                    except Exception:
-                        continue
-    except Exception as e:
-        log(f"JS extraction error: {e}")
+    log(f"Building PDF from {len(fullsize_images)} full-size pages...")
+    pdf = FPDF()
+    for url, img in fullsize_images:
+        tmp_path = Path(__file__).parent / ".tmp_page_img.png"
+        img.save(str(tmp_path))
 
-    return None
+        width_mm = img.width * 0.264583
+        height_mm = img.height * 0.264583
+        if width_mm > 200:
+            scale = 200 / width_mm
+            width_mm *= scale
+            height_mm *= scale
+
+        pdf.add_page(orientation="P" if height_mm > width_mm else "L")
+        pdf.image(str(tmp_path), x=5, y=5, w=width_mm)
+        os.remove(tmp_path)
+
+    return bytes(pdf.output())
 
 
 def _screenshot_to_pdf(page, log):
