@@ -379,14 +379,24 @@ def _build_text_pdf(text_content_jsons, log):
 
     log(f"Parsed {len(pages_data)} pages of text content")
 
-    # Determine page dimensions from the text positions
     # Standard PDF page is 612x792 points (US Letter)
     PAGE_WIDTH_PT = 612
     PAGE_HEIGHT_PT = 792
 
-    # Create PDF with fpdf2
+    # Create PDF with fpdf2 and Unicode support
     pdf = FPDF(unit="pt", format="letter")
     pdf.set_auto_page_break(auto=False)
+
+    # Add a Unicode font (DejaVu Sans ships with fpdf2)
+    font_dir = Path(__file__).parent
+    try:
+        pdf.add_font("DejaVu", "", fname="DejaVuSans.ttf")
+        pdf.add_font("DejaVu", "B", fname="DejaVuSans-Bold.ttf")
+        use_dejavu = True
+    except Exception:
+        # If DejaVu isn't available, download or use fallback
+        use_dejavu = False
+        log("DejaVu font not found, using Helvetica with character replacement")
 
     for page_idx, items in enumerate(pages_data):
         pdf.add_page()
@@ -409,13 +419,9 @@ def _build_text_pdf(text_content_jsons, log):
                 if x + item.get("width", 0) > max_x:
                     max_x = x + item.get("width", 0)
 
-        # Scale factor: map the source coordinate space to the page
-        # Source is typically ~612x792 (standard PDF points)
-        # We use a simple 1:1 mapping with margins
+        # Scale to fit within page margins (20pt each side)
         content_height = max_y - min_y if max_y > min_y else PAGE_HEIGHT_PT
         content_width = max_x if max_x > 0 else PAGE_WIDTH_PT
-
-        # Scale to fit within page margins (20pt each side)
         usable_width = PAGE_WIDTH_PT - 40
         usable_height = PAGE_HEIGHT_PT - 60
         scale_x = usable_width / content_width if content_width > usable_width else 1.0
@@ -424,7 +430,7 @@ def _build_text_pdf(text_content_jsons, log):
 
         for item in items:
             text = item.get("str", "")
-            if not text:
+            if not text or text.isspace():
                 continue
 
             transform = item.get("transform", [10, 0, 0, 10, 0, 0])
@@ -441,22 +447,59 @@ def _build_text_pdf(text_content_jsons, log):
             y_scaled = y * scale + 30  # 30pt top margin
             font_size_scaled = font_size * scale
 
-            # Determine if bold based on font name
+            # Determine if bold/italic based on font name
             font_name = item.get("fontName", "")
             style = ""
             if "bold" in font_name.lower() or "f1" in font_name:
                 style = "B"
 
+            # Sanitize text for non-Unicode fonts
+            if not use_dejavu:
+                text = _sanitize_latin1(text)
+
             try:
-                pdf.set_font("Helvetica", style=style, size=max(6, min(font_size_scaled, 24)))
+                if use_dejavu:
+                    pdf.set_font("DejaVu", style=style, size=max(6, min(font_size_scaled, 24)))
+                else:
+                    pdf.set_font("Helvetica", style=style, size=max(6, min(font_size_scaled, 24)))
                 pdf.set_xy(x_scaled, y_scaled)
                 pdf.cell(text=text)
-            except Exception:
-                pass
+            except Exception as e:
+                # Last resort: try with sanitized text
+                try:
+                    sanitized = _sanitize_latin1(text)
+                    pdf.set_font("Helvetica", style=style, size=max(6, min(font_size_scaled, 24)))
+                    pdf.set_xy(x_scaled, y_scaled)
+                    pdf.cell(text=sanitized)
+                except Exception:
+                    log(f"  ⚠ Could not render: {text[:50]}")
 
     pdf_bytes = pdf.output()
     log(f"Text PDF built: {len(pdf_bytes)} bytes, {len(pages_data)} pages")
     return bytes(pdf_bytes)
+
+
+def _sanitize_latin1(text):
+    """Replace common Unicode characters with Latin-1 equivalents."""
+    replacements = {
+        '\u2018': "'",   # left single quote
+        '\u2019': "'",   # right single quote
+        '\u201c': '"',   # left double quote
+        '\u201d': '"',   # right double quote
+        '\u2013': '-',   # en dash
+        '\u2014': '--',  # em dash
+        '\u2026': '...', # ellipsis
+        '\u00a0': ' ',   # non-breaking space
+        '\ufb01': 'fi',  # fi ligature
+        '\ufb02': 'fl',  # fl ligature
+        '\u2022': '*',   # bullet
+        '\u2032': "'",   # prime
+        '\u2033': '"',   # double prime
+    }
+    for orig, repl in replacements.items():
+        text = text.replace(orig, repl)
+    # Replace any remaining non-Latin-1 chars
+    return text.encode('latin-1', errors='replace').decode('latin-1')
 
 
 def _screenshot_to_pdf(page, log):
