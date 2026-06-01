@@ -187,7 +187,7 @@ def convert():
         )
 
     try:
-        pdf_data, filename = fetch_pdf(url)
+        pdf_data, filename = fetch_pdf(url, debug=True)
         return send_file(
             BytesIO(pdf_data),
             mimetype="application/pdf",
