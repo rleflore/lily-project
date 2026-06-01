@@ -380,9 +380,16 @@ def _screenshot_to_pdf(page, log):
             height_mm *= scale
         pdf.add_page(orientation="P" if height_mm > width_mm else "L")
         pdf.image(str(img_path), x=5, y=5, w=width_mm)
-        os.remove(img_path)
+        img.close()
 
     pdf_bytes = pdf.output()
+
+    # Clean up temp files after PDF is built
+    for img_path in screenshots:
+        try:
+            os.remove(img_path)
+        except OSError:
+            pass
     try:
         tmp_dir.rmdir()
     except OSError:
