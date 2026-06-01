@@ -145,16 +145,31 @@ def fetch_pdf(article_url, debug=False):
             page_elements = page.query_selector_all('[class*="page"]')
             log(f"Found {len(page_elements)} page elements")
 
+            # First pass: scroll slowly to trigger loading
             for i, elem in enumerate(page_elements):
                 try:
                     elem.scroll_into_view_if_needed(timeout=5000)
-                    time.sleep(0.8)
+                    time.sleep(1.5)
                 except Exception:
                     pass
 
-            # Wait for remaining network requests
+            # Wait for network to settle
             time.sleep(5)
-            log(f"Text content JSONs captured: {len(text_content_jsons)}")
+            log(f"Text content JSONs after first pass: {len(text_content_jsons)}")
+
+            # Second pass: scroll again to catch any pages that didn't load
+            if len(text_content_jsons) < len(page_elements):
+                log("Doing second scroll pass for missed pages...")
+                for i, elem in enumerate(page_elements):
+                    try:
+                        elem.scroll_into_view_if_needed(timeout=5000)
+                        time.sleep(1)
+                    except Exception:
+                        pass
+                time.sleep(5)
+                log(f"Text content JSONs after second pass: {len(text_content_jsons)}")
+
+            log(f"Total text content JSONs captured: {len(text_content_jsons)}")
 
             # Strategy 1: Check for direct PDF in responses
             pdf_data = _check_responses_for_pdf(all_responses, log)
@@ -267,11 +282,18 @@ def _build_text_pdf(text_content_jsons, log):
                 if x + item.get("width", 0) > max_x:
                     max_x = x + item.get("width", 0)
 
-        # Scale factor to fit content to page
+        # Scale factor: map the source coordinate space to the page
+        # Source is typically ~612x792 (standard PDF points)
+        # We use a simple 1:1 mapping with margins
         content_height = max_y - min_y if max_y > min_y else PAGE_HEIGHT_PT
-        scale_x = PAGE_WIDTH_PT / max(max_x, PAGE_WIDTH_PT) if max_x > 0 else 1.0
-        scale_y = (PAGE_HEIGHT_PT - 40) / content_height if content_height > 0 else 1.0
-        scale = min(scale_x, scale_y, 1.3)  # Don't scale up too much
+        content_width = max_x if max_x > 0 else PAGE_WIDTH_PT
+
+        # Scale to fit within page margins (20pt each side)
+        usable_width = PAGE_WIDTH_PT - 40
+        usable_height = PAGE_HEIGHT_PT - 60
+        scale_x = usable_width / content_width if content_width > usable_width else 1.0
+        scale_y = usable_height / content_height if content_height > usable_height else 1.0
+        scale = min(scale_x, scale_y)
 
         for item in items:
             text = item.get("str", "")
@@ -291,10 +313,6 @@ def _build_text_pdf(text_content_jsons, log):
             x_scaled = x * scale + 20  # 20pt left margin
             y_scaled = y * scale + 30  # 30pt top margin
             font_size_scaled = font_size * scale
-
-            # Clamp to page bounds
-            if y_scaled > PAGE_HEIGHT_PT - 20 or x_scaled > PAGE_WIDTH_PT - 20:
-                continue
 
             # Determine if bold based on font name
             font_name = item.get("fontName", "")
