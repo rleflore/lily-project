@@ -463,7 +463,6 @@ def _build_text_pdf(text_content_jsons, log):
             font_size_scaled = font_size * scale
 
             # Determine if bold/italic based on font name
-            # Perusall font naming: typically f1=bold, f2=regular, f3=italic, f4=bold-italic
             font_name = item.get("fontName", "")
             style = ""
             font_lower = font_name.lower()
@@ -473,18 +472,19 @@ def _build_text_pdf(text_content_jsons, log):
                 style = "B"
             elif "italic" in font_lower or "oblique" in font_lower:
                 style = "I"
-            # For Perusall's generic font names like g_d2896_f1, g_d2896_f3
-            # f3 and higher odd numbers tend to be italic variants
+            # For Perusall's generic font names like g_d2896_f1, g_d2896_f2
             elif font_name:
-                # Extract the font variant number (last part after _f)
                 parts = font_name.split("_f")
                 if len(parts) == 2 and parts[1].isdigit():
                     variant = int(parts[1])
-                    if variant == 3 or variant == 5:
+                    # f1 = bold/headings, f2 = regular body
+                    # f3 = italic, f4 = bold-italic (if they exist)
+                    if variant == 1:
+                        style = "B"
+                    elif variant == 3:
                         style = "I"
-                    elif variant == 4 or variant == 6:
+                    elif variant == 4:
                         style = "BI"
-                    # f1 and f2 are both regular (f1=serif, f2=sans or vice versa)
 
             # Sanitize text for non-Unicode fonts
             if not use_dejavu:
@@ -493,22 +493,19 @@ def _build_text_pdf(text_content_jsons, log):
             try:
                 font_style = style
                 if use_dejavu:
-                    # Fall back to regular if specific style variant isn't loaded
                     try:
                         pdf.set_font("DejaVu", style=font_style, size=max(6, min(font_size_scaled, 24)))
                     except Exception:
                         pdf.set_font("DejaVu", style="", size=max(6, min(font_size_scaled, 24)))
                 else:
                     pdf.set_font("Helvetica", style=font_style, size=max(6, min(font_size_scaled, 24)))
-                pdf.set_xy(x_scaled, y_scaled)
-                pdf.cell(text=text)
+                pdf.text(x=x_scaled, y=y_scaled + font_size_scaled, text=text)
             except Exception as e:
                 # Last resort: try with sanitized text and no style
                 try:
                     sanitized = _sanitize_latin1(text)
                     pdf.set_font("Helvetica", style="", size=max(6, min(font_size_scaled, 24)))
-                    pdf.set_xy(x_scaled, y_scaled)
-                    pdf.cell(text=sanitized)
+                    pdf.text(x=x_scaled, y=y_scaled + font_size_scaled, text=sanitized)
                 except Exception:
                     log(f"  ⚠ Could not render: {text[:50]}")
 
