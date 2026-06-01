@@ -1,6 +1,8 @@
 .auth_session/
 .tmp_screenshots/
+debug_output/
 downloads/
 __pycache__/
 *.pyc
+*.pdf
 .env
