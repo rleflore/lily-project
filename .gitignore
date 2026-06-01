@@ -1,0 +1,6 @@
+.auth_session/
+.tmp_screenshots/
+downloads/
+__pycache__/
+*.pyc
+.env
