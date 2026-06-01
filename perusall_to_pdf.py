@@ -101,7 +101,10 @@ def fetch_pdf(article_url, debug=False):
                     text_content_jsons.append((url, response))
                     log(f"  📝 Text content: {url[:100]}")
 
-                # Log PDF responses
+                # Log PDF and JSON API responses
+                elif "application/json" in content_type and "cloudfront" in url:
+                    log(f"  📦 JSON data: {url[:120]}")
+
                 elif any(kw in url.lower() for kw in ["pdf", "document-file", "original-file"]):
                     log(f"  → {response.status} | {content_type[:40]} | {url[:120]}")
 
@@ -169,12 +172,18 @@ def fetch_pdf(article_url, debug=False):
                 time.sleep(5)
                 log(f"Text content JSONs after second pass: {len(text_content_jsons)}")
 
-            log(f"Total text content JSONs captured: {len(text_content_jsons)}")
+            # Strategy: Directly fetch all text-content URLs if we found the pattern
+            # Extract the doc ID and base URL from captured text-content URLs
+            if text_content_jsons:
+                pdf_data = _fetch_all_text_content(page, text_content_jsons, all_responses, log)
 
-            # Strategy 1: Check for direct PDF in responses
-            pdf_data = _check_responses_for_pdf(all_responses, log)
+            # Fallback: Build from whatever text-content we captured
+            if not pdf_data:
+                log(f"Total text content JSONs captured: {len(text_content_jsons)}")
+                # Strategy 1: Check for direct PDF in responses
+                pdf_data = _check_responses_for_pdf(all_responses, log)
 
-            # Strategy 2: Build text PDF from text-content JSONs (primary strategy)
+            # Strategy 2: Build text PDF from text-content JSONs
             if not pdf_data:
                 pdf_data = _build_text_pdf(text_content_jsons, log)
 
@@ -213,6 +222,124 @@ def _check_responses_for_pdf(all_responses, log):
                 continue
     log("No direct PDF found in network responses.")
     return None
+
+
+def _fetch_all_text_content(page, text_content_jsons, all_responses, log):
+    """
+    Use captured text-content URLs to determine the doc ID and base URL pattern,
+    then find all page IDs from the documents API and fetch text for every page.
+    """
+    import json
+    import re
+
+    # Extract pattern from captured URLs
+    # Format: https://d12klv9dmumy6j.cloudfront.net/text-content/{docId}/{pageId}.json?Expires=...
+    sample_url = text_content_jsons[0][0]
+    match = re.search(r'(https://[^/]+/text-content/([^/]+)/)([^.?]+)\.json(\?[^"]+)', sample_url)
+    if not match:
+        log("Could not parse text-content URL pattern.")
+        return None
+
+    base_url = match.group(1)
+    doc_id = match.group(2)
+    query_params = match.group(4)
+    log(f"Document ID: {doc_id}")
+    log(f"Base URL: {base_url}")
+
+    # Find the documents API response to get all page IDs
+    page_ids = []
+
+    # Look in API responses for page list
+    for url, content_type, resp in all_responses:
+        if "application/json" in content_type and ("documents" in url or "backend" in url):
+            try:
+                body = resp.body()
+                data = json.loads(body)
+                # Look for page arrays in the response
+                pages_found = _extract_page_ids(data, doc_id)
+                if pages_found:
+                    page_ids = pages_found
+                    log(f"Found {len(page_ids)} page IDs from API")
+                    break
+            except Exception:
+                continue
+
+    # If we couldn't find page IDs from API, extract from captured URLs
+    if not page_ids:
+        for url, resp in text_content_jsons:
+            m = re.search(r'/text-content/[^/]+/([^.?]+)\.json', url)
+            if m:
+                page_ids.append(m.group(1))
+        log(f"Extracted {len(page_ids)} page IDs from captured URLs only")
+
+    # Now fetch ALL text-content JSONs (including ones we may have missed)
+    all_text_jsons = []
+
+    # First, add what we already have
+    captured_page_ids = set()
+    for url, resp in text_content_jsons:
+        m = re.search(r'/text-content/[^/]+/([^.?]+)\.json', url)
+        if m:
+            captured_page_ids.add(m.group(1))
+            all_text_jsons.append((url, resp))
+
+    # Try to fetch any missing pages
+    for pid in page_ids:
+        if pid not in captured_page_ids:
+            fetch_url = f"{base_url}{pid}.json{query_params}"
+            log(f"  Fetching missing page: {pid}")
+            try:
+                resp = page.request.get(fetch_url)
+                if resp.ok:
+                    all_text_jsons.append((fetch_url, resp))
+                    log(f"  ✓ Got text for page {pid}")
+            except Exception as e:
+                log(f"  ✗ Failed: {e}")
+
+    log(f"Total text-content JSONs (with fetched): {len(all_text_jsons)}")
+
+    if all_text_jsons:
+        return _build_text_pdf(all_text_jsons, log)
+    return None
+
+
+def _extract_page_ids(data, doc_id):
+    """Recursively search API response for page IDs related to this document."""
+    page_ids = []
+
+    if isinstance(data, dict):
+        # Look for common patterns in Perusall's API
+        for key in ["pages", "pageIds", "pageList"]:
+            if key in data and isinstance(data[key], list):
+                for item in data[key]:
+                    if isinstance(item, str):
+                        page_ids.append(item)
+                    elif isinstance(item, dict) and "_id" in item:
+                        page_ids.append(item["_id"])
+                    elif isinstance(item, dict) and "id" in item:
+                        page_ids.append(item["id"])
+
+        # Check if this is a document with an _id matching our doc
+        if data.get("_id") == doc_id or data.get("id") == doc_id:
+            if "pages" in data:
+                return _extract_page_ids(data, doc_id)
+
+        # Recurse into nested objects
+        if not page_ids:
+            for value in data.values():
+                if isinstance(value, (dict, list)):
+                    found = _extract_page_ids(value, doc_id)
+                    if found:
+                        return found
+
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, (dict, list)):
+                found = _extract_page_ids(item, doc_id)
+                if found:
+                    return found
+
+    return page_ids
 
 
 def _build_text_pdf(text_content_jsons, log):
