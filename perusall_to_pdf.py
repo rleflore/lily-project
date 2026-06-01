@@ -392,11 +392,26 @@ def _build_text_pdf(text_content_jsons, log):
     try:
         pdf.add_font("DejaVu", "", fname="DejaVuSans.ttf")
         pdf.add_font("DejaVu", "B", fname="DejaVuSans-Bold.ttf")
+        pdf.add_font("DejaVu", "I", fname="DejaVuSans-Oblique.ttf")
+        pdf.add_font("DejaVu", "BI", fname="DejaVuSans-BoldOblique.ttf")
         use_dejavu = True
     except Exception:
-        # If DejaVu isn't available, download or use fallback
-        use_dejavu = False
-        log("DejaVu font not found, using Helvetica with character replacement")
+        try:
+            # Try without italic variants
+            pdf.add_font("DejaVu", "", fname="DejaVuSans.ttf")
+            pdf.add_font("DejaVu", "B", fname="DejaVuSans-Bold.ttf")
+            use_dejavu = True
+        except Exception:
+            use_dejavu = False
+            log("DejaVu font not found, using Helvetica with character replacement")
+
+    # Log unique font names from first page to help debug
+    if pages_data:
+        font_names = set()
+        for item in pages_data[0]:
+            if item.get("fontName"):
+                font_names.add(item["fontName"])
+        log(f"Font names found: {sorted(font_names)}")
 
     for page_idx, items in enumerate(pages_data):
         pdf.add_page()
@@ -448,27 +463,50 @@ def _build_text_pdf(text_content_jsons, log):
             font_size_scaled = font_size * scale
 
             # Determine if bold/italic based on font name
+            # Perusall font naming: typically f1=bold, f2=regular, f3=italic, f4=bold-italic
             font_name = item.get("fontName", "")
             style = ""
-            if "bold" in font_name.lower() or "f1" in font_name:
+            font_lower = font_name.lower()
+            if "bold" in font_lower and "italic" in font_lower:
+                style = "BI"
+            elif "bold" in font_lower:
                 style = "B"
+            elif "italic" in font_lower or "oblique" in font_lower:
+                style = "I"
+            # For Perusall's generic font names like g_d2896_f1, g_d2896_f3
+            # f3 and higher odd numbers tend to be italic variants
+            elif font_name:
+                # Extract the font variant number (last part after _f)
+                parts = font_name.split("_f")
+                if len(parts) == 2 and parts[1].isdigit():
+                    variant = int(parts[1])
+                    if variant == 3 or variant == 5:
+                        style = "I"
+                    elif variant == 4 or variant == 6:
+                        style = "BI"
+                    # f1 and f2 are both regular (f1=serif, f2=sans or vice versa)
 
             # Sanitize text for non-Unicode fonts
             if not use_dejavu:
                 text = _sanitize_latin1(text)
 
             try:
+                font_style = style
                 if use_dejavu:
-                    pdf.set_font("DejaVu", style=style, size=max(6, min(font_size_scaled, 24)))
+                    # Fall back to regular if specific style variant isn't loaded
+                    try:
+                        pdf.set_font("DejaVu", style=font_style, size=max(6, min(font_size_scaled, 24)))
+                    except Exception:
+                        pdf.set_font("DejaVu", style="", size=max(6, min(font_size_scaled, 24)))
                 else:
-                    pdf.set_font("Helvetica", style=style, size=max(6, min(font_size_scaled, 24)))
+                    pdf.set_font("Helvetica", style=font_style, size=max(6, min(font_size_scaled, 24)))
                 pdf.set_xy(x_scaled, y_scaled)
                 pdf.cell(text=text)
             except Exception as e:
-                # Last resort: try with sanitized text
+                # Last resort: try with sanitized text and no style
                 try:
                     sanitized = _sanitize_latin1(text)
-                    pdf.set_font("Helvetica", style=style, size=max(6, min(font_size_scaled, 24)))
+                    pdf.set_font("Helvetica", style="", size=max(6, min(font_size_scaled, 24)))
                     pdf.set_xy(x_scaled, y_scaled)
                     pdf.cell(text=sanitized)
                 except Exception:
