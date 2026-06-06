@@ -7,9 +7,10 @@ Usage:
 """
 
 import sys
+import os
 from flask import Flask, render_template_string, request, send_file, redirect, url_for
 from io import BytesIO
-from perusall_to_pdf import login_interactive, is_logged_in, fetch_pdf
+from perusall_to_pdf import login_interactive, is_logged_in, fetch_pdf, SESSION_DIR
 
 app = Flask(__name__)
 
@@ -186,8 +187,13 @@ def convert():
             HTML_TEMPLATE, error="That doesn't look like a Perusall URL.", last_url=url
         )
 
+    print(f"[*] Converting: {url[:80]}", flush=True)
+    print(f"[*] Session dir: {SESSION_DIR}", flush=True)
+    print(f"[*] Session exists: {is_logged_in()}", flush=True)
+
     try:
         pdf_data, filename = fetch_pdf(url, debug=True)
+        print(f"[+] Success! {len(pdf_data)} bytes → {filename}", flush=True)
         return send_file(
             BytesIO(pdf_data),
             mimetype="application/pdf",
@@ -195,7 +201,11 @@ def convert():
             download_name=filename,
         )
     except Exception as e:
-        return render_template_string(HTML_TEMPLATE, error=str(e), last_url=url)
+        error_text = str(e)
+        # Show just the first line in the UI, full detail in terminal
+        ui_error = error_text.split("\n")[0]
+        print(f"[!] Error: {error_text}", flush=True)
+        return render_template_string(HTML_TEMPLATE, error=ui_error, last_url=url)
 
 
 if __name__ == "__main__":
@@ -205,12 +215,14 @@ if __name__ == "__main__":
         if not is_logged_in():
             print("=" * 50)
             print("  No login session found!")
+            print(f"  Session dir: {SESSION_DIR}")
             print("  Run: python app.py --login")
             print("=" * 50)
             sys.exit(1)
 
         print("=" * 50)
         print("  Perusall to PDF Web App")
+        print(f"  Session dir: {SESSION_DIR}")
         print("  Open: http://localhost:5000")
         print("  Share via ngrok: ngrok http 5000")
         print("=" * 50)

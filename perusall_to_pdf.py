@@ -195,7 +195,7 @@ def fetch_pdf(article_url, debug=False):
             browser.close()
 
         if not pdf_data:
-            error_msg = "Could not extract PDF.\n\nDebug info:\n" + "\n".join(debug_log[-20:])
+            error_msg = "Could not extract PDF. Session may have expired — try logging in again.\n\nDebug info:\n" + "\n".join(debug_log[-20:])
             raise RuntimeError(error_msg)
 
         # Generate filename from URL
@@ -619,19 +619,16 @@ def _screenshot_to_pdf(page, log):
             width_mm *= scale
             height_mm *= scale
         pdf.add_page(orientation="P" if height_mm > width_mm else "L")
-        pdf.image(str(img_path), x=5, y=5, w=width_mm)
+        # Pass PIL image directly to avoid file locking on Windows
+        pdf.image(img, x=5, y=5, w=width_mm)
         img.close()
 
     pdf_bytes = pdf.output()
 
-    # Clean up temp files after PDF is built
-    for img_path in screenshots:
-        try:
-            os.remove(img_path)
-        except OSError:
-            pass
+    # Clean up temp files
+    import shutil
     try:
-        tmp_dir.rmdir()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     except OSError:
         pass
 
